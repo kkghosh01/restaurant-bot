@@ -22,6 +22,25 @@ from orders import (
 )
 
 from parser import extract_order
+import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+    def log_message(self, format, *args):
+        pass  # Log spam বন্ধ
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
 
 
 # ─────────────────────────────────────────────────────
@@ -199,24 +218,15 @@ async def set_commands(app):
 if __name__ == "__main__":
     print("🚀 Bot চালু হচ্ছে...")
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    # ✅ শুধু এখানে একবার start
+    threading.Thread(target=run_health_server, daemon=True).start()
 
-    # Commands
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", show_menu))
     app.add_handler(CommandHandler("reset", reset_order))
-
-    # Messages
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_message,
-        )
-    )
-
-    # Register bot commands
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.post_init = set_commands
 
     print(f"✅ {RESTAURANT_NAME} Bot ready!")
-
     app.run_polling()
