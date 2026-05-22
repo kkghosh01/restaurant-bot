@@ -18,12 +18,45 @@ from menu import get_menu_text, RESTAURANT_NAME
 from keyboards import main_keyboard
 from ai import get_ai_reply, reset_session
 from orders import (
-    init_order, get_order, get_state, set_state,
-    add_item, set_address, set_phone,
-    get_order_summary, get_full_summary, calculate_total,
+    init_order,
+    get_order,
+    get_state,
+    set_state,
+    add_item,
+    set_address,
+    set_phone,
+    get_order_summary,
+    get_full_summary,
+    calculate_total,
 )
 from parser import extract_order
 from states import OrderState
+from database import init_db, save_order
+
+
+def is_done_signal(text: str) -> bool:
+    DONE_SIGNALS = [
+        "না",
+        "হয়ে গেছে",
+        "শেষ",
+        "আর না",
+        "আর কিছু না",
+        "এটুকুই",
+        "done",
+        "no",
+    ]
+
+    text_lower = text.lower().strip()
+
+    # Exact match check
+    if text_lower in DONE_SIGNALS:
+        return True
+
+    # "ok" only when it's the whole input (allow repetitions like "ok", "okk")
+    if re.fullmatch(r"ok+", text_lower):
+        return True
+
+    return False
 
 
 # ─── Health Server ───────────────────────────────────
@@ -32,8 +65,10 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
+
     def log_message(self, format, *args):
         pass
+
 
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
@@ -44,6 +79,7 @@ def run_health_server():
 def confirm_keyboard():
     buttons = [["✅ Confirm", "❌ Cancel"]]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
 
 def done_keyboard():
     buttons = [["🔄 নতুন অর্ডার"]]
@@ -96,9 +132,9 @@ async def reset_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Main Handler ────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id  = update.effective_user.id
+    user_id = update.effective_user.id
     user_text = update.message.text.strip()
-    state    = get_state(user_id)
+    state = get_state(user_id)
 
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
@@ -128,8 +164,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_text in ["🛒 অর্ডার করুন", "❓ সাহায্য"]:
             set_state(user_id, OrderState.ORDERING)
             await update.message.reply_text(
-                "কী অর্ডার করতে চান? Item এবং quantity একসাথে বলুন।\n\n"
-                f"{get_menu_text()}",
+                f"কী অর্ডার করতে চান? Item এবং quantity একসাথে বলুন।\n\n{get_menu_text()}",
                 reply_markup=main_keyboard(),
             )
             return
@@ -144,10 +179,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ════════════════════════════════════════════════
     if state == OrderState.ORDERING:
         # Order শেষ করার signal
-        DONE_SIGNALS = ["না", "হয়ে গেছে", "শেষ", "আর না",
-                        "আর কিছু না", "এটুকুই", "ok", "done", "no"]
-
-        if any(sig in user_text.lower() for sig in DONE_SIGNALS):
+        if is_done_signal(user_text):
             order = get_order(user_id)
             if not order["items"]:
                 await update.message.reply_text(
@@ -158,8 +190,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             set_state(user_id, OrderState.ADDRESS)
             await update.message.reply_text(
-                f"আপনার অর্ডার:\n{get_order_summary(user_id)}\n\n"
-                "📍 এখন আপনার ঠিকানা লিখুন:",
+                f"আপনার অর্ডার:\n{get_order_summary(user_id)}\n\n📍 এখন আপনার ঠিকানা লিখুন:",
                 reply_markup=main_keyboard(),
             )
             return
@@ -176,8 +207,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text(
-                "❌ Item টি মেনুতে নেই। আবার চেষ্টা করুন।\n\n"
-                f"{get_menu_text()}",
+                f"❌ Item টি মেনুতে নেই। আবার চেষ্টা করুন।\n\n{get_menu_text()}",
                 reply_markup=main_keyboard(),
             )
         return
@@ -189,8 +219,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_address(user_id, user_text)
         set_state(user_id, OrderState.PHONE)
         await update.message.reply_text(
-            f"📍 ঠিকানা: {user_text}\n\n"
-            "📱 এখন আপনার ফোন নম্বর দিন:",
+            f"📍 ঠিকানা: {user_text}\n\n📱 এখন আপনার ফোন নম্বর দিন:",
             reply_markup=main_keyboard(),
         )
         return
@@ -212,9 +241,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_state(user_id, OrderState.CONFIRM)
 
         await update.message.reply_text(
-            f"📋 অর্ডার Summary:\n\n"
-            f"{get_full_summary(user_id)}\n\n"
-            "✅ Confirm করবেন?",
+            f"📋 অর্ডার Summary:\n\n{get_full_summary(user_id)}\n\n✅ Confirm করবেন?",
             reply_markup=confirm_keyboard(),
         )
         return
@@ -224,11 +251,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ════════════════════════════════════════════════
     if state == OrderState.CONFIRM:
         if user_text == "✅ Confirm":
+            order = get_order(user_id)
             total = calculate_total(user_id)
             summary = get_full_summary(user_id)
 
+            # ✅ Database-এ save করো
+            order_id = save_order(
+                user_id=user_id,
+                items=order["items"],
+                address=order["address"],
+                phone=order["phone"],
+                total=total,
+            )
+
             await update.message.reply_text(
-                f"🎉 অর্ডার Confirmed!\n\n"
+                f"🎉 অর্ডার Confirmed! (#{order_id})\n\n"
                 f"{summary}\n\n"
                 f"💰 মোট: ৳{total}\n"
                 f"🚚 30-40 মিনিটে delivery হবে।\n\n"
@@ -236,40 +273,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=done_keyboard(),
             )
 
-            # Reset
             reset_session(user_id)
             init_order(user_id)
-
-        elif user_text == "❌ Cancel":
-            reset_session(user_id)
-            init_order(user_id)
-            await update.message.reply_text(
-                "❌ অর্ডার cancel হয়েছে।",
-                reply_markup=main_keyboard(),
-            )
-        return
 
 
 # ─── Bot Commands ────────────────────────────────────
 async def set_commands(app):
-    await app.bot.set_my_commands([
-        BotCommand("start",   "Bot চালু করুন"),
-        BotCommand("menu",    "মেনু দেখুন"),
-        BotCommand("reset",   "Order reset করুন"),
-        BotCommand("contact", "যোগাযোগ"),
-    ])
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Bot চালু করুন"),
+            BotCommand("menu", "মেনু দেখুন"),
+            BotCommand("reset", "Order reset করুন"),
+            BotCommand("contact", "যোগাযোগ"),
+        ]
+    )
 
 
 # ─── Main ────────────────────────────────────────────
 if __name__ == "__main__":
     print("🚀 Bot চালু হচ্ছে...")
+    # ✅ Database initialize
+    init_db()
 
     threading.Thread(target=run_health_server, daemon=True).start()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("menu",    show_menu))
-    app.add_handler(CommandHandler("reset",   reset_order))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", show_menu))
+    app.add_handler(CommandHandler("reset", reset_order))
     app.add_handler(CommandHandler("contact", contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.post_init = set_commands
