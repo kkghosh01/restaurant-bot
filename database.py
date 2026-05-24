@@ -1,4 +1,12 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    DateTime,
+    ForeignKey,
+    BigInteger,
+)
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from datetime import datetime, timezone, timedelta
 import os
@@ -67,7 +75,7 @@ class Order(Base):
     __tablename__ = "orders"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False)
+    user_id = Column(BigInteger, nullable=False)
     address = Column(String, nullable=False)
     phone = Column(String, nullable=False)
     total = Column(Integer, nullable=False)
