@@ -7,9 +7,13 @@ import json
 # ─── Engine ──────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///orders.db")
 
-# PostgreSQL URL fix (Render দেয় postgres://, SQLAlchemy চায় postgresql://)
+# PostgreSQL URL fix (Render provides postgres://; ensure SQLAlchemy uses psycopg driver)
+# postgres:// -> postgresql+psycopg://
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+# postgresql:// -> postgresql+psycopg:// (also convert if already postgresql)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 # Use different engine settings for SQLite vs other DBs (PostgreSQL)
 if DATABASE_URL.startswith("sqlite"):
