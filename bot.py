@@ -1,9 +1,10 @@
 import os
 import threading
 import re
+import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
-
-from telegram import Update, BotCommand, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, BotCommand, ReplyKeyboardMarkup
+from telegram.error import TimedOut, NetworkError
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
@@ -31,7 +32,22 @@ from orders import (
 )
 from parser import extract_order
 from states import OrderState
-from database import init_db, save_order
+from database import (
+    init_db,
+    save_order,
+    save_payment,
+    get_pending_order_by_user,  # ✅ নতুন
+    get_order_by_id,  # ✅ নতুন
+    has_pending_payment,  # ✅ নতুন
+    cancel_order,  # ✅ নতুন
+    load_menu_cache,
+    seed_menu,
+)
+
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def is_done_signal(text: str) -> bool:
@@ -92,6 +108,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_session(user_id)
     init_order(user_id)
 
+    # ✅ Pending order check করো
+    pending = get_pending_order_by_user(user_id)
+
+    if pending:
+        # Session restore করো
+        order = get_order(user_id)
+        order["order_id"] = pending.id
+        order["total"] = pending.total
+        set_state(user_id, OrderState.PAYMENT)
+
+        await update.message.reply_text(
+            f"🕒 আপনার একটি pending payment আছে!\n\n"
+            f"📋 Order ID: ORDER-{pending.id:04d}\n"
+            f"💰 Amount: ৳{pending.total}\n\n"
+            f"💳 Payment করুন:\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"bKash Personal: 01737-233015\n"
+            f"Amount: ৳{pending.total}\n"
+            f"Reference: ORDER-{pending.id:04d}\n"
+            f"━━━━━━━━━━━━━━━━\n\n"
+            f"Transaction ID এবং শেষ ৪ সংখ্যা পাঠান।\n"
+            f"উদাহরণ: TRX8HG23K 4831",
+            reply_markup=ReplyKeyboardMarkup(
+                [["❌ Cancel Order"]], resize_keyboard=True
+            ),
+        )
+        return
+
+    # কোনো pending order নেই → normal start
     await update.message.reply_text(
         f"🎉 {RESTAURANT_NAME}-এ স্বাগতম!\n\n"
         "আমি আপনার AI Food Assistant 🤖\n\n"
@@ -136,10 +181,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     state = get_state(user_id)
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=ChatAction.TYPING,
-    )
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.TYPING,
+        )
+    except (TimedOut, NetworkError) as e:
+        logger.warning("Network timeout sending chat action: %s", e)
+    except Exception as e:
+        logger.exception("Unexpected error sending chat action: %s", e)
 
     # ── Button shortcuts ────────────────────────────
     if user_text == "🍽️ মেনু দেখুন":
@@ -162,12 +212,81 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ════════════════════════════════════════════════
     if state == OrderState.IDLE:
         if user_text in ["🛒 অর্ডার করুন", "❓ সাহায্য"]:
+            # Clear AI memory before entering ORDERING
+            reset_session(user_id)
             set_state(user_id, OrderState.ORDERING)
             await update.message.reply_text(
                 f"কী অর্ডার করতে চান? Item এবং quantity একসাথে বলুন।\n\n{get_menu_text()}",
                 reply_markup=main_keyboard(),
             )
             return
+        # ✅ যদি message deterministic order pattern (e.g., "1 pizza")
+        #    তাহলে AI কল না করে deterministic flow চালাও
+        qty, item_name = extract_order(user_text)
+        if item_name:
+            # Clear AI memory before entering ORDERING
+            reset_session(user_id)
+            # Move to ORDERING and add the item deterministically
+            set_state(user_id, OrderState.ORDERING)
+            item_added = add_item(user_id, item_name, qty)
+
+            if item_added:
+                await update.message.reply_text(
+                    f"✅ Added!\n\n{get_order_summary(user_id)}\n\n"
+                    "আরও কিছু লাগবে? নাকি 'না' বললে ঠিকানায় যাবো।",
+                    reply_markup=main_keyboard(),
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Item টি মেনুতে নেই। আবার চেষ্টা করুন।\n\n{get_menu_text()}",
+                    reply_markup=main_keyboard(),
+                )
+            return
+
+        # ✅ যদি user ORDER-XXXX format-এ message করে
+        order_pattern = re.match(r"ORDER-(\d+)", user_text.upper().strip())
+        if order_pattern:
+            order_id = int(order_pattern.group(1))
+
+            # DB থেকে order খোঁজো
+            db_order = get_order_by_id(order_id)
+
+            if (
+                db_order
+                and db_order.status == "pending"
+                and db_order.user_id == user_id
+            ):
+                # Session restore করো
+                order = get_order(user_id)
+                order["order_id"] = order_id
+                order["total"] = db_order.total
+                # Clear AI memory before entering PAYMENT
+                reset_session(user_id)
+                set_state(user_id, OrderState.PAYMENT)
+
+                await update.message.reply_text(
+                    f"✅ Order পাওয়া গেছে!\n\n"
+                    f"📋 ORDER-{order_id:04d}\n"
+                    f"💰 Amount: ৳{db_order.total}\n\n"
+                    f"💳 Payment করুন:\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"bKash: 01737-233015\n"
+                    f"Amount: ৳{db_order.total}\n"
+                    f"Reference: ORDER-{order_id:04d}\n"
+                    f"━━━━━━━━━━━━━━━━\n\n"
+                    f"Transaction ID এবং শেষ ৪ সংখ্যা পাঠান।\n"
+                    f"উদাহরণ: TRX8HG23K 4831",
+                    reply_markup=ReplyKeyboardMarkup(
+                        [["❌ Cancel Order"]], resize_keyboard=True
+                    ),
+                )
+                return
+            else:
+                await update.message.reply_text(
+                    "⚠️ Order পাওয়া যায়নি।",
+                    reply_markup=main_keyboard(),
+                )
+                return
 
         # যেকোনো কথায় AI reply
         reply = get_ai_reply(user_id, user_text)
@@ -188,6 +307,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
+            # Clear AI memory before entering ADDRESS (sensitive)
+            reset_session(user_id)
             set_state(user_id, OrderState.ADDRESS)
             await update.message.reply_text(
                 f"আপনার অর্ডার:\n{get_order_summary(user_id)}\n\n📍 এখন আপনার ঠিকানা লিখুন:",
@@ -197,6 +318,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Item parse করো
         qty, item_name = extract_order(user_text)
+
+        # Validate parser output — avoid None item_name
+        if not item_name:
+            await update.message.reply_text(
+                "⚠️ বুঝতে পারিনি। আবার লিখুন।\n\nউদাহরণ:\n1 pizza\n2 burger",
+                reply_markup=main_keyboard(),
+            )
+            return
+
         item_added = add_item(user_id, item_name, qty)
 
         if item_added:
@@ -217,6 +347,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ════════════════════════════════════════════════
     if state == OrderState.ADDRESS:
         set_address(user_id, user_text)
+        # Clear AI memory before entering PHONE (sensitive)
+        reset_session(user_id)
         set_state(user_id, OrderState.PHONE)
         await update.message.reply_text(
             f"📍 ঠিকানা: {user_text}\n\n📱 এখন আপনার ফোন নম্বর দিন:",
@@ -238,6 +370,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         set_phone(user_id, user_text)
+        # Clear AI memory before entering CONFIRM (sensitive)
+        reset_session(user_id)
         set_state(user_id, OrderState.CONFIRM)
 
         await update.message.reply_text(
@@ -253,9 +387,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_text == "✅ Confirm":
             order = get_order(user_id)
             total = calculate_total(user_id)
-            summary = get_full_summary(user_id)
+            summary = get_full_summary(user_id)  # ✅ এখানে বানাচ্ছি
 
-            # ✅ Database-এ save করো
             order_id = save_order(
                 user_id=user_id,
                 items=order["items"],
@@ -264,17 +397,111 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 total=total,
             )
 
+            order["order_id"] = order_id
+            order["total"] = total
+            # Clear AI memory before entering PAYMENT (sensitive)
+            reset_session(user_id)
+            set_state(user_id, OrderState.PAYMENT)
+
             await update.message.reply_text(
-                f"🎉 অর্ডার Confirmed! (#{order_id})\n\n"
-                f"{summary}\n\n"
-                f"💰 মোট: ৳{total}\n"
-                f"🚚 30-40 মিনিটে delivery হবে।\n\n"
-                f"ধন্যবাদ! 🙏",
-                reply_markup=done_keyboard(),
+                f"✅ অর্ডার নেওয়া হয়েছে!\n\n"
+                f"📋 Order ID: ORDER-{order_id:04d}\n\n"
+                f"🧾 Summary:\n{summary}\n\n"  # ✅ summary use হচ্ছে
+                f"💳 এখন payment করুন:\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"bKash Personal: 01737-233015\n"
+                f"Amount: ৳{total}\n"
+                f"Reference: ORDER-{order_id:04d}\n"
+                f"━━━━━━━━━━━━━━━━\n\n"
+                f"⏰ ৩০ মিনিটের মধ্যে payment করুন।\n\n"
+                f"Payment করা হলে Transaction ID এবং "
+                f"আপনার bKash নম্বরের শেষ ৪ সংখ্যা পাঠান।\n\n"
+                f"উদাহরণ: TRX8HG23K 4831",
+                reply_markup=ReplyKeyboardMarkup(
+                    [["❌ Cancel Order"]], resize_keyboard=True
+                ),
             )
+            return
+    # ════════════════════════════════════════════════
+    # STATE: PAYMENT — TRX ID + last 4 digits নাও
+    # ════════════════════════════════════════════════
+    if state == OrderState.PAYMENT:
+        if user_text == "❌ Cancel Order":
+            order = get_order(user_id)
+            order_id = order.get("order_id", 0)
+
+            # ✅ Fix 1 — DB-তে cancelled করো
+            if order_id:
+                cancel_order(order_id)
 
             reset_session(user_id)
             init_order(user_id)
+            await update.message.reply_text(
+                "❌ অর্ডার cancel হয়েছে।",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        # Format: "TRX8HG23K 4831"
+        parts = user_text.strip().split()
+
+        if len(parts) != 2 or len(parts[1]) != 4 or not parts[1].isdigit():
+            await update.message.reply_text(
+                "⚠️ সঠিক format-এ দিন:\n\n"
+                "Transaction ID + শেষ ৪ সংখ্যা\n"
+                "উদাহরণ: TRX8HG23K 4831",
+            )
+            return
+
+        trx_id = parts[0]
+        phone_last4 = parts[1]
+        order = get_order(user_id)
+        order_id = order.get("order_id", 0)
+        total = order.get("total", 0)
+
+        # ✅ Duplicate payment check
+        if has_pending_payment(order_id):
+            await update.message.reply_text(
+                "⚠️ এই order-এ already payment submit করা হয়েছে।\n"
+                "Admin verify করছেন। একটু অপেক্ষা করুন।",
+                reply_markup=done_keyboard(),
+            )
+            reset_session(user_id)
+            init_order(user_id)
+            return
+
+        # Strict TRX ID validation: only accept 8-20 alphanumeric characters
+        if not re.fullmatch(r"[A-Za-z0-9]{8,20}", trx_id):
+            await update.message.reply_text(
+                "⚠️ Transaction ID-এর format ভুল। IDটি 8-20টি আলফানিউমেরিক অক্ষর হতে হবে।\n\nউদাহরণ: TRX8HG23K 4831",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        # DB-তে payment save করো
+        saved = save_payment(
+            order_id=order_id,
+            trx_id=trx_id,
+            phone_last4=phone_last4,
+            amount=total,
+        )
+
+        if saved:
+            await update.message.reply_text(
+                f"⏳ Payment যাচাই হচ্ছে...\n\n"
+                f"Order ID: ORDER-{order_id:04d}\n"
+                f"TRX ID: {trx_id}\n\n"
+                f"Admin verify করার পরে আপনাকে জানানো হবে। "
+                f"সাধারণত ৫-১০ মিনিট সময় লাগে।",
+                reply_markup=done_keyboard(),
+            )
+            reset_session(user_id)
+            init_order(user_id)
+        else:
+            await update.message.reply_text(
+                "⚠️ কোনো সমস্যা হয়েছে। আবার চেষ্টা করুন।",
+            )
+        return
 
 
 # ─── Bot Commands ────────────────────────────────────
@@ -289,11 +516,38 @@ async def set_commands(app):
     )
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        logger.exception("Exception while handling an update:", exc_info=context.error)
+    except Exception:
+        logger.exception("Failed to log exception in error_handler")
+
+    # Optionally notify the user that something went wrong
+    try:
+        if update and getattr(update, "effective_message", None):
+            await update.effective_message.reply_text(
+                "⚠️ একটি সার্ভারের ত্রুটি ঘটেছে। পরে আবার চেষ্টা করুন।"
+            )
+    except Exception:
+        logger.exception("Failed to send error message to user")
+
+
 # ─── Main ────────────────────────────────────────────
 if __name__ == "__main__":
     print("🚀 Bot চালু হচ্ছে...")
     # ✅ Database initialize
     init_db()
+    seed_menu()
+    load_menu_cache()
+    # Mark any pending payments that already expired
+    try:
+        from database import cleanup_expired_payments
+
+        expired_count = cleanup_expired_payments()
+        if expired_count:
+            logger.info("Marked %d expired payments", expired_count)
+    except Exception as e:
+        logger.exception("Failed to cleanup expired payments: %s", e)
 
     threading.Thread(target=run_health_server, daemon=True).start()
 
@@ -304,6 +558,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("contact", contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.post_init = set_commands
+    app.add_error_handler(error_handler)
 
     print(f"✅ {RESTAURANT_NAME} Bot ready!")
     app.run_polling()

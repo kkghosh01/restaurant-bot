@@ -1,4 +1,5 @@
-from menu import MENU
+import re
+import database
 from states import OrderState
 
 # ─── Storage ─────────────────────────────────────────
@@ -46,33 +47,68 @@ def get_order(user_id: int) -> dict:
 def add_item(user_id: int, item_name: str, qty: int = 1) -> bool:
     if user_id not in orders:
         init_order(user_id)
+    # Use the central MENU_CACHE from the database module so we always
+    # read the current cache without shadowing the variable.
+    MENU = database.MENU_CACHE
 
+    if not MENU:
+        print("⚠️ Menu cache empty!")
+        return False
+
+    # Normalize input
     text = item_name.lower().strip()
+    user_words = set(re.findall(r"\w+", text, flags=re.UNICODE))
 
     best_match = None
     best_score = 0
+
+    # Matching priority and scoring:
+    # - exact alias or exact name (immediate match)
+    # - bangla exact -> high score
+    # - alias word match -> medium
+    # - exact english word match -> low
+    # Minimum score required to accept a match: 5
 
     for category in MENU.values():
         for item in category:
             score = 0
 
-            # English word match — প্রতিটা word-এর জন্য score বাড়াও
-            english_words = item["name"].lower().split()
-            for w in english_words:
-                if len(w) > 3 and w in text:
-                    score += 2  # exact word match
+            name = item.get("name", "").lower()
+            aliases = [a.lower() for a in item.get("aliases", [])]
+            bangla = [b.lower() for b in item.get("bangla", [])]
 
-            # Bangla match
-            for kw in item.get("bangla", []):
-                if kw in text or text in kw:
-                    score += 3  # bangla match বেশি important
+            # 1) Full-text exact match (name or alias)
+            if text == name or text in aliases:
+                best_match = item
+                best_score = 999
+                break
+
+            # 2) Bangla exact/word match (strong signal)
+            for kw in bangla:
+                if kw == text:
+                    score += 8
+                elif kw in user_words:
+                    score += 4
+
+            # 3) Alias word matches
+            for a in aliases:
+                if a == text:
+                    score += 10
+                elif a in user_words:
+                    score += 5
+
+            # 4) English name word matches (require reasonable length)
+            for w in name.split():
+                if len(w) > 2 and w in user_words:
+                    score += 3
 
             if score > best_score:
                 best_score = score
                 best_match = item
 
-    # Minimum score না হলে match নেই
-    if best_match and best_score >= 2:
+    # Accept only confident matches to avoid false positives
+    if best_match and best_score >= 5:
+        # Already আছে কিনা check
         for existing in orders[user_id]["items"]:
             if existing["name"] == best_match["name"]:
                 existing["qty"] += qty
